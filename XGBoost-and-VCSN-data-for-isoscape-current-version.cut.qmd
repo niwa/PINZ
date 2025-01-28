@@ -1,0 +1,1361 @@
+---
+title: "XGBoost and VCSN data for isoscapes"
+author: "Andy McKenzie (NIWA)"
+date: "`r format(Sys.Date(), '%d %B, %Y')`"
+format:
+  html:
+    code-fold: false     
+    toc: true
+    toc-location: left
+    toc-title: Table of contents
+    number-sections: true
+editor: visual
+execute: 
+  cache: true
+  warnings: false
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup}
+# warning is false in the YAML header, but doesn't seem to work
+knitr::opts_chunk$set(
+  warning = FALSE,
+  message = FALSE
+)
+
+setwd("C:/Users/dudleybd/Desktop/Precip isotope model/XGBoost isoscape")
+library(sf)   # need by vcsn functions
+library(readr)
+library(writexl)
+library(skimr)
+library(lubridate)
+library(GGally) # for ggpairs
+library(ggplot2)
+library(conflicted)
+library(stars)
+
+library(elevatr)  # for point elevation data
+
+library(rnaturalearth)
+library(rnaturalearthdata)
+# devtools::install_github("ropensci/rnaturalearthhires")
+library(rnaturalearthhires)
+
+library(tree)
+
+library(flextable)
+set_flextable_defaults(big.mark = "")
+
+ft <- function(input.data, caption = "", num.rows = Inf) {
+ ft <- input.data |>
+   slice_head(n = num.rows) |>
+   flextable() |>
+   autofit() |>
+   theme_zebra() |>
+   set_caption(caption)
+ ft
+}
+
+library(tidymodels)
+# to handle conflicts of tidymodels with other packages
+tidymodels_prefer()
+
+# model agnostic explainers for tidymodels
+library(DALEXtra)
+
+source("../auxiliary.code.R")
+source("../vcsn.functions.R")
+
+# speed up computation with parallel processing (esp during tuning)
+library(doParallel)
+all_cores <- parallel::detectCores(logical = FALSE)
+registerDoParallel(cores = all_cores)
+
+# output directory
+unlink("output", recursive = TRUE)
+dir.create("output")
+```
+
+# New things
+
+# Precipitation isotope data
+
+## Raw data from Excel spreadsheet
+
+One sheet from the Master Excel sheet contains the monthly data by site. Another sheet contains site information: lat, long, and elevation.
+
+[Master Excel Spreadsheet](https://niwa-my.sharepoint.com/personal/bruce_dudley_niwa_co_nz/_layouts/15/onedrive.aspx?csf=1&web=1&e=hB4BFU&cid=ad371b58%2D892c%2D40db%2D974e%2D7dea4f7d9893&id=%2Fpersonal%2Fbruce%5Fdudley%5Fniwa%5Fco%5Fnz%2FDocuments%2FPrecip%20isotope%20data%20master%20files&FolderCTID=0x012000B57007D9F243404E9236FE044971C271&view=0)
+
+```{r}
+#
+# The d180 data 
+#
+
+data.Excel.orig <- iso_master_extract_data(
+  path.file.location = "../data/precip.iso.database.nz.24th.Jun.2024.xlsx",
+  data.type = "Monthly",
+  quiet = TRUE
+)
+
+# Make a date column
+ddata <- data.Excel.orig |>
+  select(Group, Project, Site, SampleID, year, month, day, d18O = O18) |>
+  mutate(Date = lubridate::make_date(year, month, day = day)) |>
+  select(-day)
+
+#
+# Site information 
+#
+
+data.Excel.site.info.orig <- iso_master_extract_data(
+  path.file.location = "../data/precip.iso.database.nz.24th.Jun.2024.xlsx",
+  data.type = "SITE DATA lookup"
+)
+
+# Make a date column
+site.info <- data.Excel.site.info.orig |>
+  select(Site, area, lat = lat, lon = long, height = ELEVATION)
+
+slice_head(ddata, n = 3)
+slice_head(site.info, n = 3)
+```
+
+The number of observations by (group, project, site) and time period over which they cover. Note that the Invercargill site has data collected under two slightly different project names.
+
+```{r}
+table.amount.data <- ddata |>
+  group_by(Group, Project, Site) |>
+  summarise(n = n(), 
+            MinDate = min(Date, na.rm = TRUE),
+            MaxDate = max(Date, na.rm = TRUE)
+  ) 
+
+writexl::write_xlsx(table.amount.data, path = "output/table.amount.data.xlsx")
+
+total.number.samples <- nrow(ddata)
+total.number.sites <- length(unique(ddata$Site))
+
+```
+
+The total number of samples is `r total.number.samples` from `r total.number.sites` unique sites.
+
+Number of observations by site: sorted by site name, and number of observations.
+
+```{r}
+# sort by site name
+table.amount.data.site <- ddata |>
+  group_by(Site) |>
+  summarise(n = n(), 
+            MinDate = min(Date, na.rm = TRUE),
+            MaxDate = max(Date, na.rm = TRUE)
+  ) 
+
+table.amount.data.site |>
+  arrange(Site) |>
+  ft()
+
+# sort by number of observations (low to high)
+table.amount.data.site |>
+  arrange(n) |>
+  ft()
+```
+
+## Missing values
+
+```{r}
+data.missing.O18 <- data.Excel.orig |>
+  mutate(rownumber = 1:nrow(data.Excel.orig), .before = Group) |>
+  filter(is.na(O18))
+writexl::write_xlsx(data.missing.O18, path = "output/data.missing.O18.xlsx")
+
+data.missing.day <- data.Excel.orig |>
+  mutate(rownumber = 1:nrow(data.Excel.orig), .before = Group) |>  
+  filter(is.na(day))
+writexl::write_xlsx(data.missing.day, path = "output/data.missing.day.xlsx")
+```
+
+There are `r nrow(data.missing.O18)` missing d18O values, for which many are highlighted as red rows in the master Excel spreadsheet. These are dropped in the next bit of code.
+
+There are `r nrow(data.missing.day)` records with missing day values.
+
+```{r}
+ddata <- ddata |>
+  filter(!is.na(d18O))
+
+skimr::skim(ddata)
+```
+
+## Drop FREW53 site
+
+During kriging for the sinusoidal model, there were lots of warning as the sites "FREW53" and "Arthurs Pass" had the same closed VCSN point, leading to a singular covariance matrix. The quick solution to this was remove the FREW53 site.
+
+It is noted that, the hyperparmeter tuning ran into problems:
+
+```         
+→ A | warning: A correlation computation is required, but `estimate` is constant and has 0 standard deviation, resulting in a divide by 0 error. `NA` will be returned.
+```
+
+```         
+There were issues with some computations   A: x1 There were issues with some computations   A: x1
+```
+
+```         
+Warning: More than one set of outcomes were used when tuning. This should never happen. Review how the outcome is specified in your model.
+```
+
+This may be related to the same site problem and correlations, so the FREW53 site is removed.
+
+```{r}
+ddata <- ddata |>
+  filter(Site != "FREW 53")
+```
+
+Height is present for all sites.
+
+```{r}
+skimr::skim(site.info)
+# check ddata for sites with no matches in site.info
+dplyr::anti_join(ddata, site.info, by = join_by(Site))
+
+site.info.missing.ELEVATION <- data.Excel.site.info.orig |>
+  mutate(rownumber = 1:nrow(site.info), .before = Site) |>
+  filter(is.na(ELEVATION))
+writexl::write_xlsx(site.info.missing.ELEVATION , path = "output/site.info.missing.ELEVATION.xlsx")
+```
+
+Retain just the site information for those sites in monthly data.
+
+```{r}
+site.info.match <- site.info |>
+  dplyr::semi_join(ddata, by = join_by(Site))
+
+nrow(site.info.match)
+length(unique(ddata$Site))
+```
+
+## Temporal span by site
+
+```{r}
+number.samples.before.2000 <- ddata |>
+  filter(year < 2000) |>
+  nrow()
+
+percent.before.2000 <- number.samples.before.2000/nrow(ddata)*100
+```
+
+Except for the two "GNIP" sites at Invercargill and Kaitaia, all the data are after the year 2000. The number of samples before the 2000 year is `r number.samples.before.2000` which is `r round(percent.before.2000)`% of the samples.
+
+```{r}
+#| fig-height: 10
+ggplot(ddata, aes(x= Date, y = Site)) +
+  geom_point(colour = "blue") +
+  theme(axis.text.y = element_text(size = 6))
+```
+
+## Plot site locations
+
+Site location is shown by North Island and South Island.
+
+```{r, fig.height=8}
+iso_plot_site_locations(site.info.match, "Site", "lat", "lon", 
+                        island = "NI", 
+                        max.overlaps = 14)
+
+iso_plot_site_locations(site.info.match, "Site", "lat", "lon", 
+                        island = "SI", 
+                        max.overlaps = 18)
+
+iso_plot_site_locations(site.info.match, "Site", "lat", "lon", 
+                        island = "upper SI")
+
+iso_plot_site_locations(site.info.match, "Site", "lat", "lon", 
+                        island = "lower SI", 
+                        max.overlaps = 15)
+```
+
+## Spatial distribution of number of observations
+
+```{r fig.height=8}
+table.obs.by.site <- count(ddata, Site) |>  
+  left_join(site.info, by = join_by(Site)) |> 
+  select(Site, lat, lon, `Number of observations` = n)  
+
+iso_plot_spatial_static(table.obs.by.site, "Site", "lat", "lon",                          "Number of observations")
+```
+
+## Plot raw data time series by site
+
+The raw data are from different years, and notably some from GNIP site goes back to 1960 and 1980. The minimum date over all sites is `r min(ddata$Date)` and the maximum date is `r max(ddata$Date)`.
+
+Sites are plotted in alphabetical order.
+
+```{r raw d18O plotted, fig.height=10}
+the.sites <- ddata |>
+  distinct(Site) |>
+  arrange(Site)
+
+iso_plot_raw(ddata,  "Site", "Date", "d18O", 
+             "Raw d18O by site",
+             sites = the.sites$Site[1:21], 
+             plot.scales = "free_x")
+
+iso_plot_raw(ddata, "Site", "Date", "d18O", 
+             "Raw d18O by site", 
+             sites = the.sites$Site[22:42], 
+             plot.scales = "free_x")
+
+iso_plot_raw(ddata,  "Site", "Date", "d18O", 
+             "Raw d18O by site",
+             sites = the.sites$Site[43:63], 
+             plot.scales = "free_x")
+
+iso_plot_raw(ddata,  "Site", "Date", "d18O", 
+             "Raw d18O by site",
+             sites = the.sites$Site[64:84], 
+             plot.scales = "free_x")
+
+iso_plot_raw(ddata,  "Site", "Date", "d18O", 
+             "Raw d18O by site",
+             sites = the.sites$Site[85:nrow(the.sites)], 
+             plot.scales = "free_x")
+```
+
+```{r}
+ggplot(ddata, aes(Date)) +
+  geom_density(fill = "blue") +
+  scale_x_date(date_breaks = "5 year",
+     date_minor_breaks = "1 year",
+     date_labels = "%Y") 
+
+table.num.obs.by.year <- count(ddata, year)
+print(table.num.obs.by.year, n = nrow(table.num.obs.by.year))
+```
+
+# Appending VCSN daily climate data
+
+## Site and nearest VCSN daily climate data
+
+These are extracted for all years in the isotope data. This takes a long time (2-3 days), so is done once and saved, then results are loaded. A preferable faster approach would be directly extract VCSN *monthly* summary data from the CLIDB database. Monthly being the resolution of the precipitation isotope data.
+
+<https://niwa.co.nz/climate/our-services/virtual-climate-stations>
+
+The climate fields in the VCSN data are identified as
+
+<https://oneniwa.atlassian.net/wiki/spaces/CLIDB/pages/64520478/VCSN+Times+and+Field+Descriptions#VCSNTimesandFieldDescriptions-VCSNTimesandFieldDescriptions>
+
+MSLP (Mean Sea Level Pressure) PET (Potential Evapotranspiration) Rain (daily rainfall) RH (relative humidity) SoilM (soil moisture) ETmp (earth temperature at 10cm depth) Rad (solar radiation) TMax (maximum temperature) Tmin (minimum temperature) VP (vapour pressure) Wind (average wind speed at 10m above ground level) Rain_bc (Rainfall with bias correction) Tmax_N (maximum temperature via different method) Tmin_N (minimum temperature via different method)
+
+Potential evaporation or potential evapotranspiration is defined as the amount of evaporation that would occur if a sufficient water source were available.
+
+```{r}
+VCSN.directory <- "../vcsn_data/"
+# need to cover the years in the data
+#  - start in 1962
+years <- sort(unique(ddata$year))
+
+#site.info.plus.climate.data <- vcsn_append_climate_information(site.info.match,
+   #                                                             VCSN.directory,
+  #                                                              years)
+#save(site.info.plus.climate.data, file = "data/site.info.plus.climate.data.RData")
+
+
+load(file = "../data/site.info.plus.climate.data.RData")
+
+site.info.plus.climate.data <- site.info.plus.climate.data |>
+  mutate(year = year(Date), .after = Date)
+
+slice_head(site.info.plus.climate.data, n = 5)
+
+# incomplete data for some VCSN quantities
+skimr::skim(site.info.plus.climate.data)
+
+# no data for some earlier years and many climate variables
+site.info.plus.climate.data |>
+  filter(is.na(PET)) |>
+ count(year)
+
+# replace -999.9 for MSLP with NA
+MSLP.need.replacing <- site.info.plus.climate.data |>
+  filter(MSLP == -999.9)
+
+count(MSLP.need.replacing, year)
+
+site.info.plus.climate.data <- site.info.plus.climate.data |>
+  mutate(MSLP = na_if(MSLP, -999.9))
+
+skimr::skim(site.info.plus.climate.data, MSLP)
+
+site.info.plus.climate.data |>
+  group_by(year) |>
+  skim(Wind)
+
+site.info.plus.climate.data.1960s <- site.info.plus.climate.data |>
+  filter(year %in% c(1962, 1963, 1967))
+
+# Just Rain, Rain_bc columns in the data
+skimr::skim(site.info.plus.climate.data.1960s)
+
+num.sites <- length(unique(ddata$Site))
+
+# 365*91 = 33215 observations in year (for 91 sites)
+table.num.climate.obs.by.year <- site.info.plus.climate.data |>
+  pivot_longer(cols = MSLP:Tmin_N, 
+               names_to = "Quantity", 
+               values_to = "Value") |> 
+  drop_na(Value) |>
+  count(year, Quantity) |>
+  pivot_wider(names_from = Quantity, 
+              values_from = n)
+```
+
+The number of sites is `r num.sites`. So in a year with 365/366 days the maximum number of daily VCSN climate observations at a site is `r num.sites*365` or `r num.sites*366`. Looking over all years and VCSN climate observations types, all columns are complete from 1972, except for "Wind" which turns up in 2005.
+
+```{r}
+ft(table.num.climate.obs.by.year)
+```
+
+*Tmin* and *TMax* are dropped, with the Norton adjust versions *Tmin_N* and *Tmax_N* retained. Similarly *Rain* is dropped with the bias-corrected version *Rain_bc* retained.
+
+The isotope measurements at each site are monthly (nominally the middle of the month), and need associated VCSN monthly climate values associated with them. Hence the daily VCSN climate data are reduced to monthly mean values at each site.
+
+Height at the site is retained for the monthly summary data, although of course it remains unchanged.
+
+```{r}
+site.info.climate.monthly <- site.info.plus.climate.data |>
+  select(-Tmin, -TMax, -Rain) |>
+  mutate(month = lubridate::month(Date), 
+         year  = lubridate::year(Date)
+         ) |>
+  summarise(across(MSLP:Tmin_N, ~ mean(.x, na.rm = TRUE)), 
+            .by = c(Site, height, area, lat, lon, year, month)
+            ) |>
+  arrange(Site, year, month)
+
+# clear out the memory
+rm(site.info.plus.climate.data)
+rm(site.info.plus.climate.data.1960s)
+```
+
+## Isotope data appended with monthly mean VCSN climate data
+
+To the monthly isotope measurements at each site, are appended the monthly mean VCSN climate data for the year of the isotope measurement.
+
+Dropped for the modelling data set are *SampleID*, *variable*, *agent.number*, *Date*, *area*, *year*
+
+```{r}
+all.data <- ddata |>
+  dplyr::left_join(site.info.climate.monthly) |>
+  relocate(area, .after = Site) |>
+  mutate(Month = factor(month.abb[month], levels = month.abb, ordered = TRUE), 
+         .before = lat) |>
+  relocate(d18O) 
+
+
+# For exploratory correlation analysis drop fields that are not mean values VCSN data
+iso.data <- all.data |>
+  select(-SampleID, -Date, -Group, -Project, -Site, -area, -year) |>
+  select(-month)
+
+names(iso.data)
+
+# As above, but retain the Site and Date variables for the model fit checking
+iso.data.Site <- all.data |>
+  select(-SampleID, -Group, -Project, -area, -year, -month)
+```
+
+## Closer look at GNIP INVERCARGILL site temporal changes
+
+The distribution of the predicted variable d18O, and predictor variables, looks similar before and after year 2000. Note the *Wind* predictor variable is in the VCSN data for 2005 onward.
+
+```{r}
+#| fig-height: 10
+inv.data.wide <- all.data |> 
+  filter(Site == "GNIP INVERCARGILL") |>
+  select(-Group, -Project, -area, -SampleID, -year, -Month, -month,
+         -height, -Site, -lat, -lon) |>
+  relocate(d18O, .after = Tmin_N)
+
+inv.data.long <- inv.data.wide |>
+  tidyr::pivot_longer(
+    cols = -Date,
+    names_to = "Quantity",
+    values_to = "Value"
+  ) |>
+  drop_na(Value) |>
+  mutate(`After 2000` = if_else(Date > lubridate::make_date(2000, 1, 1),
+    "Yes",
+    "No"
+  )) 
+
+# Values versus time
+ggplot(inv.data.long, aes(Date, Value)) +
+  geom_point(size = 1, colour = "brown") +
+  geom_smooth() +
+  facet_wrap(vars(Quantity), scales = "free_y", ncol = 2)
+
+# Density plots before and after 200
+ggplot(inv.data.long, aes(Value, 
+                          colour = `After 2000`,
+                          group = `After 2000`)) +
+  geom_density(linewidth = 1.2) +
+  facet_wrap(vars(Quantity), scales = "free_x", ncol = 2)
+```
+
+## Isotope data for 2000 onward
+
+```{r}
+iso.data.2000.onward <- all.data |>
+  filter(year >= 2000) |>
+  select(-SampleID, -Date, -Group, -Project, -Site, -area, -year) |>
+  select(-month)
+
+iso.data.Site.2000.onward <- all.data |>
+  filter(year >= 2000) |>
+  select(-SampleID, -Group, -Project, -area, -year, -month)
+```
+
+# Exploratory data analysis
+
+## Distribution of d180
+
+```{r}
+min.d18O <- min(iso.data$d18O, na.rm = TRUE)
+ddata.min.d18O <- ddata |>
+  filter(d18O == min.d18O)
+```
+
+The minimum value of d18O is `r min.d18O`:
+
+```{r}
+ddata.min.d18O
+```
+
+```{r}
+ggplot(data = iso.data, aes(d18O)) +
+  geom_histogram(fill = "blue")
+```
+
+The "highest" mean values of d18O (most negative) occur in the centre of the South Island, and the lowest at the top of the North Island (which include the site GNIP Kaitaia).
+
+```{r}
+mean.d18O.by.site <- iso.data.Site |>
+  summarise(mean.neg.d18O = -mean(d18O, na.rm = TRUE), .by = c(Site, lat, lon))
+slice_max(mean.d18O.by.site, mean.neg.d18O, n = 5 )
+slice_min(mean.d18O.by.site, mean.neg.d18O, n = 5 )
+
+iso_plot_spatial_static(mean.d18O.by.site, "Site", "lat", "lon", "mean.neg.d18O" )
+sum(is.na(mean.d18O.by.site$lat))
+```
+
+## Correlations
+
+d18O has the highest correlation with Tmin_N (earth temperature at 10 cm depth), followed by ETmp. ETmp is highly correlated with VP.
+
+```{r}
+#| fig-height: 6
+# heatmap for correlation
+iso.data |>
+  select(-Month) |>
+  GGally::ggcorr(label = TRUE, label_round = 2)
+```
+
+```{r}
+#| eval: false
+#| fig-height: 10
+iso.data |>
+  select(-Month) |>
+  GGally::ggpairs(upper = "blank")
+```
+
+Plotting up d18O vs continuous predictor with a smoothed loess curve shows some obvious correlations.
+
+```{r}
+#| fig-height: 10
+d180.vs.climate <- iso.data |> 
+  dplyr::select(-Month) |>
+  pivot_longer(cols = -d18O, names_to = "Predictor", values_to = "Value")
+
+plot.d180.vs.continuous <- ggplot(d180.vs.climate, aes(x = Value, y = d18O)) +
+  geom_point(colour = "blue", size = 1) +
+  geom_smooth(colour = "brown") +
+  facet_wrap(vars(Predictor), scale = "free_x")
+
+plot.d180.vs.continuous
+```
+
+And there are monthly patterns.
+
+```{r}
+ggplot(iso.data, aes(x = Month, y = d18O)) +
+  geom_boxplot()
+```
+
+A exploratory tree regression indicates that *Tmin_N* has the highest predictive power, and what other variables and their interactions are important.
+
+```{r fig.height=8}
+tree.data <- iso.data.Site |> select(-Site, -Date)
+tree.model <- tree::tree(d18O ~ ., data = tree.data)
+#plot(tree.model)
+#text(tree.model)
+```
+
+# XGBoost model 2000 onward
+
+## Initial data split
+
+The data are split up into training data (80%) and test data (20%).
+
+This is done within d18O quartile strata, then pooled. The use of d18O strata ensures that the there are similar distributions for the training and test data sets.
+
+```{r}
+set.seed(386201)
+iso.split <- rsample::initial_split(
+  data = iso.data.Site.2000.onward,
+  prop = 0.80,
+)
+
+iso.training <- rsample::training(iso.split)
+iso.test     <- rsample::testing(iso.split)
+```
+
+## Preprocessing
+
+Make "Site" and "Date" identification variables to use in model fit checking.
+
+```{r}
+preprocessing_recipe <- 
+  recipes::recipe(d18O ~ ., data = iso.training) |>
+  update_role(Site, Date, new_role = "ID") |>
+  step_dummy(all_nominal_predictors())
+```
+
+## Setup XGBoost model
+
+```{r}
+xgboost_model <- 
+  parsnip::boost_tree(
+    mode = "regression",
+    trees = 1000,
+    min_n = tune(),
+    tree_depth = tune(),
+    learn_rate = tune(),
+    loss_reduction = tune()
+  ) |>
+    set_engine("xgboost", objective = "reg:squarederror")
+```
+
+## Setup workflow
+
+Define the workflow
+
+```{r}
+ xgboost_wf <- 
+   workflows::workflow() |>
+   add_model(xgboost_model) |> 
+   add_recipe(preprocessing_recipe)
+```
+
+## Grid specification
+
+```{r}
+xgboost_params <- 
+  dials::parameters(
+    min_n(),
+    tree_depth(),
+    learn_rate(),
+    loss_reduction()
+  )
+```
+
+```{r}
+xgboost_grid <- 
+  dials::grid_max_entropy(
+    xgboost_params, 
+    size = 60
+  )
+
+knitr::kable(head(xgboost_grid))
+```
+
+## Cross validation split
+
+```{r}
+set.seed(8493)
+iso.cv.folds <- rsample::vfold_cv(iso.training, v = 5)
+```
+
+## Tune the model
+
+```{r}
+# hyperparameter tuning
+conflict_prefer("rmse", "yardstick")
+conflict_prefer("mae", "yardstick")
+xgboost_tuned <- tune::tune_grid(
+  object = xgboost_wf,
+  resamples = iso.cv.folds,
+  grid = xgboost_grid,
+  metrics = yardstick::metric_set(rmse, rsq, mae),
+  control = tune::control_grid(verbose = FALSE)
+)
+```
+
+Show best values for hyperparameters. Sorted by minimum rmse, but the same for top two if use rsq and mae.
+
+```{r}
+xgboost_tuned %>%
+  tune::show_best(metric = "rmse") |>
+  knitr::kable()
+
+show_best(xgboost_tuned, metric = "rsq", n = 2)
+show_best(xgboost_tuned, metric = "mae", n = 2)
+```
+
+For the final model we use the best values from the rmse criterion.
+
+```{r}
+xgboost_best_params <- xgboost_tuned %>%
+  tune::select_best("rmse")
+
+knitr::kable(xgboost_best_params)
+```
+
+**min_n** An integer for the minimum number of data points in a node that is required for the node to be split further.
+
+**tree_depth** An integer for the maximum depth of the tree (i.e. number of splits) (specific engines only).
+
+**learn_rate** A number for the rate at which the boosting algorithm adapts from iteration-to-iteration (specific engines only). This is sometimes referred to as the shrinkage parameter.
+
+**loss_reduction** A number for the reduction in the loss function required to split further (specific engines only).
+
+## Final model
+
+Final XGBoost model using the tuned hyperparameter values.
+
+```{r}
+xgboost_model_final <- xgboost_model %>% 
+  finalize_model(xgboost_best_params)
+```
+
+Final workflow
+
+```{r}
+xgboost_wf_final <- xgboost_wf |>
+  tune::finalize_workflow(xgboost_best_params)
+
+xgboost_wf_final
+```
+
+## Final fit
+
+Finally, let's fit this final model to the training data and use our test data to estimate the model performance we expect to see with new data.
+
+We can use the function last_fit() with our finalized model; this function fits the finalized model on the full training data set and evaluates the finalized model on the **testing data**.
+
+```{r}
+model.fit <- xgboost_wf_final |>
+  fit(data = iso.training)
+
+final_fit <- xgboost_wf_final |>
+  tune::last_fit(iso.split)
+
+final_fit |> collect_metrics()
+```
+
+## R-squared values
+
+For training, test, and all data combined.
+
+```{r}
+training_prediction <- predict(model.fit, new_data = iso.training) |>
+  bind_cols(iso.training)
+
+test_prediction <- predict(model.fit, new_data = iso.test) |>
+  bind_cols(iso.test)
+
+R2.training <- cor(training_prediction$d18O, training_prediction$.pred, method = "pearson")
+
+R2.test <- cor(test_prediction$d18O, test_prediction$.pred, 
+               method = "pearson")  
+
+R2.training
+R2.test
+```
+
+## Explaining model predictions
+
+### Global feature importance
+
+Global feature importance is evaluated by shuffling a columns values to see how much difference this makes to model performance. If it doesn't make much difference then the variable is unimportant.
+
+vip = variable importance plots
+
+```{r}
+explainer_xg <- 
+  DALEXtra::explain_tidymodels(
+      model = model.fit,
+      data  = iso.training, 
+      y     = iso.training$d18O, 
+      label = "Boosted regression tree", 
+      verbose = TRUE
+  )
+
+set.seed(3861)
+vip_xg <- DALEX::model_parts(explainer_xg, loss_function = loss_root_mean_square)
+
+plot(vip_xg)
+```
+
+Comparing to plots of d18O versus each predictor variable, for data after the year 2000, shows consistency with the above, with d18O varying strongly with *ETmp* and *Tmin_N*.
+
+```{r}
+#| fig-height: 10
+d180.vs.climate.2000.onward <- iso.data.2000.onward |> 
+  dplyr::select(-Month) |>
+  pivot_longer(cols = -d18O, names_to = "Predictor", values_to = "Value")
+
+plot.d180.vs.continuous <- ggplot(d180.vs.climate.2000.onward, aes(x = Value, y = d18O)) +
+  geom_point(colour = "blue", size = 1) +
+  geom_smooth(colour = "brown") +
+  facet_wrap(vars(Predictor), scale = "free_x")
+
+plot.d180.vs.continuous
+```
+
+### Partial dependence profiles
+
+This shows how the predicted value of d18O changes with rainfall, minimum temperature, and latitude. The plots look similar to that back in the exploratory data analysis section.
+
+All the data (i.e. training and test) are used for this (*N = NULL*).
+
+```{r}
+set.seed(83983)
+pdp_rain_Tmin_lat <- DALEX::model_profile(explainer_xg,
+  N = NULL,
+  variables = c(
+    "Tmin_N", 
+    "ETmp",
+    "lat",
+    "height"
+  )
+)
+
+plot(pdp_rain_Tmin_lat)
+
+
+```
+
+# All data predictions
+
+```{r}
+all_prediction <- predict(model.fit, new_data = iso.data.Site.2000.onward) |>
+  bind_cols(iso.data.Site.2000.onward |>
+  select(Site, lat, lon, Date, d18O)) |>
+  mutate(
+    residual = d18O - .pred,
+    residual_pct = abs(residual / d18O * 100)
+  )
+
+d18O_all_pred_long <- all_prediction |>
+  select(Site, lat, lon, Date, `Observed d18O` = d18O, Predicted = .pred) |>
+  tidyr::pivot_longer(
+    cols = c("Observed d18O", "Predicted"),
+    names_to = "Type",
+    values_to = "d18O"
+  )
+```
+
+## Plots of observed and predicted at all sites
+
+These are plotted in alphabetical order for the site name.
+
+```{r}
+sites.group1 <- the.sites$Site[1:21]
+sites.group2 <- the.sites$Site[22:42]
+sites.group3 <- the.sites$Site[43:63]
+sites.group4 <- the.sites$Site[64:84]
+
+```
+
+```{r}
+#| fig-height: 8
+iso_plot_obs_fitted(d18O_all_pred_long, sites.group1)
+iso_plot_obs_fitted(d18O_all_pred_long, sites.group2)
+iso_plot_obs_fitted(d18O_all_pred_long, sites.group3)
+iso_plot_obs_fitted(d18O_all_pred_long, sites.group4)
+```
+
+## Observed and predicted over all sites
+
+```{r}
+R2 <- cor(all_prediction$d18O, all_prediction$.pred, method = "pearson")
+
+ggplot(all_prediction, aes(x = d18O, y = .pred)) +
+  geom_point(colour = "blue", alpha = 0.3) +
+  geom_abline(slope = 1, linetype = 2, linewidth = 1.2,  colour = "brown") +
+  xlab("Observed d18O") + 
+  ylab("Predicted d18O") +
+  ggtitle(paste("Pearson correlation coefficient = ", round(R2, 2) ))
+```
+
+For values of d18O less than -10 (i.e more negative) the model tends to predict a value higher than observed.
+
+And for values greater than about -2.5 (i.e. closer to zero) the model tends to predict a value lower than observed.
+
+```{r}
+ggplot(all_prediction, aes(x = d18O, y = residual)) +
+  geom_point(colour = "blue") +
+  geom_abline(slope = 0, linetype = 2, linewidth = 1.2,  colour = "brown") +
+  xlab("Observed d18O") + 
+  ylab("Residuals (observed - predicted)")
+```
+
+Where and when is the model having trouble predicting (d18O values \< -10, greater \> -2.5)?
+
+```{r}
+predict.trouble <- all_prediction |>
+  filter(d18O < -10 | d18O > -2.5) |>
+  mutate(Month = lubridate::month(Date, label = TRUE)) 
+
+
+
+num.trouble.by.site <- predict.trouble |>
+  count(Site,lat,lon) |>
+  arrange(desc(n))
+
+slice_head(num.trouble.by.site, n = 10)
+
+num.trouble.by.month <- predict.trouble |>
+  count(Month) |>
+  arrange(desc(n))
+
+num.trouble.by.month
+```
+
+Spatial plot of number of observations at a site that are troublesome (also see up next the RSME and MAD by site).
+
+```{r}
+iso_plot_spatial_static(num.trouble.by.site, "Site", "lat", "lon", "n")
+```
+
+Remove those for which percent residual (of observed) is 100% or more.
+
+```{r}
+all_prediction |>
+  filter(residual_pct < 100) |>
+  ggplot(aes(x = d18O, y = residual_pct)) +
+    geom_point(colour = "blue") +
+    xlab("Observed d18O") + 
+    ylab("Residual percent of observed")
+```
+
+```{r}
+max_residual_pct <- max(all_prediction$residual_pct)
+
+all_prediction |>
+  filter(residual_pct < 100) |>
+  ggplot(aes(residual_pct)) +
+    geom_density(fill = "blue") +
+    scale_x_continuous(breaks = seq(0, 100, by = 10)) +
+    xlab("Residual percent of observed") +
+    ylab("Density")
+```
+
+## Spatial distribution of residuals
+
+Plot RMSE and MAD for each site.
+
+```{r fig.height=8}
+# no lat, lon in all_prediction
+all_prediction_spatial <- all_prediction |>
+  select(-lat, -lon) |>
+  left_join(site.info, by = join_by(Site))
+
+spatial_residual_by_site <- all_prediction_spatial |>
+  group_by(Site, lat, lon) |>
+  summarise(
+    rmse = sqrt(sum(residual^2) / n()),
+    mad = median(abs(residual))
+  )
+
+
+iso_plot_spatial_static(spatial_residual_by_site, "Site", "lat", "lon", "rmse")
+
+iso_plot_spatial_static(spatial_residual_by_site, "Site", "lat", "lon", "mad")
+
+                  
+```
+
+# Predicting over NZ
+
+## Base NZ map
+
+```{r}
+nzmap <- rnaturalearth::ne_countries(scale = 'large', 
+                      country = "New Zealand",
+                      returnclass = 'sf')
+
+st_is_longlat(nzmap)
+
+# Exclude Chatham Islands
+nzmap.proj <- nzmap %>% 
+  st_crop(xmin = 164.8, xmax = 179.4, ymin = -47.7, ymax = -33.8)
+
+
+ggplot() + 
+    geom_sf(data = nzmap.proj, fill = "darkgreen") + 
+    coord_sf(xlim = c(164.8, 179.4), ylim = c(-47.7, -33.8)) +
+    xlab("Longitude") +
+    ylab("Latitude") +
+    ggtitle("NZ map")
+```
+
+## Elevation data at VCSN points
+
+These can be obtained using the R package *elevatr.*
+
+<https://cran.r-project.org/web/packages/elevatr/vignettes/introduction_to_elevatr.html#Key_information_about_version_0990_and_upcoming_versions_of_elevatr>
+
+Elevations are obtained from Amazon Web Services (AWS) with a zoom of z = 11. The accuracy is unknown, and this requires further exploration. These take a while to download and process (5-10 minutes), so is done once and saved, then loaded subsequently.
+
+```{r}
+# sf object
+# vcsn.agent.locations <- vcsn_agent_locations("Q:/CLIMATE/vcsn_data/")
+
+# vcsn.agent.elevations <- vcsn.agent.locations |>
+#   elevatr::get_elev_point(src = "aws", z = 11)
+
+# save(vcsn.agent.elevations, file = "data/vcsn.agent.elevations.RData")
+
+load("../data/vcsn.agent.elevations.RData")
+
+```
+
+Plot the elevation map.
+
+```{r fig.height=8}
+elevation.stars <- vcsn.agent.elevations |>
+  st_drop_geometry() |>
+  dplyr::select(lon = vcsn.lon, lat = vcsn.lat, elevation) |>
+  stars::st_as_stars(dims = c("lon", "lat"))   
+
+ggplot() + 
+  geom_stars(data = elevation.stars) +
+  coord_sf(expand = FALSE) +
+  scale_fill_continuous(type = "viridis") + 
+  labs(fill = "Elevation (m)") +  
+  xlab("Longitude") +
+  ylab("Latitude")
+
+```
+
+## VCSN climate data for 2023
+
+Daily VCSN climate data is downloaded for 2023.
+
+Climate variables are selected that are used in the trained model, and mean values of these found by month for each VCSN station. The estimated elevation at each VCSN station is joined to the data.
+
+Site and Date columns with NA values are added, as these were in the model as identification variables (not predictors).
+
+```{r}
+# vcsn.2023.orig <- vcsn_combine_daily_data(VCSN.directory = "Q:/CLIMATE/vcsn_data/", 
+ #                         years = 2023)
+# save(vcsn.2023.orig, file = "data/vcsn.2023.orig.RData")
+
+load(file = "../data/vcsn.2023.orig.RData")
+
+vcsn.2023 <- vcsn.2023.orig |> 
+  rename(lat = Lat, lon = Longt) |>
+  mutate(Month = lubridate::month(Date, label = TRUE), .after = Date)
+
+names(iso.data.Site)
+#  [1] "d18O"    "Site"    "Date"    "height"  "Month"   "lat"     "lon"     "MSLP"    "PET"     "RH"      "SoilM"  
+# [12] "ETmp"    "Rad"     "VP"      "Wind"    "Rain_bc" "Tmax_N"  "Tmin_N"
+
+table.Agent.elevation <- vcsn.agent.elevations |>
+  st_drop_geometry() |>
+  select(Agent, height = elevation)
+
+vcsn.2023.month <- vcsn.2023 |>
+  select(Agent, Month, lat, lon, 
+    MSLP, PET, RH, SoilM, ETmp, Rad, VP, Wind,
+    Rain_bc, Tmax_N, Tmin_N
+  ) |>
+  summarise(across(MSLP:Tmin_N, ~ mean(.x, na.rm = TRUE)),
+    .by = c(Agent, Month, lat, lon)
+  ) |>
+  left_join(table.Agent.elevation, by = join_by(Agent)) |>
+  relocate(height, .before = Month) |>
+  mutate(Date = NA) |>
+  relocate(Date) |>
+  mutate(Site = NA) |>
+  relocate(Site) 
+
+num.VCSN.Agent <- length(unique(vcsn.2023.month$Agent))
+```
+
+The number of row of data is equal to the number of VCSN stations (`r num.VCSN.Agent`) \* 12 months = `r nrow(vcsn.2023.month)`.
+
+```{r}
+glimpse(vcsn.2023.month)
+
+
+
+# Remove large objects to clear the memory
+rm(vcsn.2023.orig)
+rm(vcsn.2023)
+```
+
+## Prediction and plotting
+
+### Only January
+
+An example of prediction and plotting for the January month.
+
+```{r}
+vcsn.2023.month.Jan <- vcsn.2023.month |>
+  filter(Month == "Jan")
+
+nz_prediction_Jan <- predict(model.fit, new_data = vcsn.2023.month.Jan) |>
+    bind_cols(vcsn.2023.month.Jan) |>
+    select(lat, lon, d18O.pred = .pred) |>
+    stars::st_as_stars(dims = c("lon", "lat")) 
+```
+
+```{r fig.height=8}
+ggplot() + 
+  geom_stars(data = nz_prediction_Jan) +
+  coord_sf(expand = FALSE) +
+  scale_fill_continuous(type = "viridis") + 
+  labs(fill = "Predicted d18O") +  
+  xlab("Longitude") +
+  ylab("Latitude")
+```
+
+### All Months
+
+```{r}
+nz_prediction <- predict(model.fit, new_data = vcsn.2023.month) |>
+    bind_cols(vcsn.2023.month) |>
+    select(lat, lon, Month, d18O.pred = .pred) |>
+    stars::st_as_stars(dims = c("lon", "lat", "Month")) 
+```
+
+```{r fig.height=10}
+ggplot() + 
+  geom_stars(data = nz_prediction) +
+  coord_sf(expand = FALSE) +
+  scale_fill_continuous(type = "viridis") + 
+  labs(fill = "Predicted d18O") +  
+  xlab("Longitude") +
+  ylab("Latitude") +
+  facet_wrap(vars(Month), ncol = 3, nrow = 4)  
+```
+
+### Now the last several years at Ashley, Mawhera and Maimai catchments.
+
+First read in full data VCSN data file since 2007 and snip it.
+
+```{r}
+load(file = "../data/vcsn.2007.2023.RData")
+
+vcsn.2020.2023<- subset(vcsn.2007.2023, Date> "2020-01-01" & Date < "2024-01-01")
+rm(vcsn.2007.2023)
+vcsn.2020.2023.orig<-vcsn.2020.2023
+vcsn.2020.2023 <- vcsn.2020.2023 |> 
+  rename(lat = Lat, lon = Longt) |>
+  mutate(Month = lubridate::month(Date, label = TRUE), .after = Date) |>
+  mutate(Year= year(lubridate::ymd(Date)), .after = Month)
+
+names(iso.data.Site)
+#  [1] "d18O"    "Site"    "Date"    "height"  "Month"   "lat"     "lon"     "MSLP"    "PET"     "RH"      "SoilM"  
+# [12] "ETmp"    "Rad"     "VP"      "Wind"    "Rain_bc" "Tmax_N"  "Tmin_N"
+
+table.Agent.elevation <- vcsn.agent.elevations |>
+  st_drop_geometry() |>
+  select(Agent, height = elevation)
+
+vcsn.2020.2023.month <- vcsn.2020.2023 |>
+  select(Agent, Month, Year, lat, lon, 
+    MSLP, PET, RH, SoilM, ETmp, Rad, VP, Wind,
+    Rain_bc, Tmax_N, Tmin_N
+  ) |>
+  summarise(across(MSLP:Tmin_N, ~ mean(.x, na.rm = TRUE)),
+    .by = c(Agent, Month, Year, lat, lon)
+  ) |>
+  left_join(table.Agent.elevation, by = join_by(Agent)) |>
+  relocate(height, .before = Month) |>
+  mutate(Date = NA) |>
+  relocate(Date) |>
+  mutate(Site = NA) |>
+  relocate(Site) 
+
+num.VCSN.Agent <- length(unique(vcsn.2020.2023.month$Agent))
+
+rm(vcsn.2020.2023)
+
+```
+
+### Then predict over NZ
+
+For this we want the full model because it works better at Ashley and Mawhera sites
+
+```{r}
+
+nz_prediction.2020.2023 <- predict(model.fit, new_data = vcsn.2020.2023.month) |>
+    bind_cols(vcsn.2020.2023.month) |>
+    select(lat, lon, Month, Year, d18O.pred = .pred) |>
+    stars::st_as_stars(dims = c("lon", "lat", "Month", "Year")) 
+```
+
+```{r}
+ggplot() + 
+  geom_stars(data = nz_prediction.2020.2023) +
+  coord_sf(expand = FALSE) +
+  scale_fill_continuous(type = "viridis") + 
+  labs(fill = "Predicted d18O") +  
+  xlab("Longitude") +
+  ylab("Latitude") +
+  facet_wrap(vars(Month, Year), ncol = 12, nrow = 4)  
+```
+
+Then just pull out a dataframe of the predictions
+
+```{r}
+nz_prediction_frame_23 <- predict(model.fit, new_data = vcsn.2020.2023.month) |>
+    bind_cols(vcsn.2020.2023.month) |>
+    select(Agent, lat, lon, Month, Year, MSLP, PET, RH, SoilM, ETmp, Rad, VP, Wind,
+    Rain_bc, Tmax_N, Tmin_N, d18O.pred = .pred)
+
+nz_prediction_frame_23$day<-15
+add.dates<-nz_prediction_frame_23 %>% 
+  select(day, Month, Year) %>% 
+  mutate(Date = make_date(Year, Month, day))
+nz_prediction_frame_23$Date<-add.dates$Date
+
+write.csv(nz_prediction_frame_23, "XGBoost18Opreds2020_2023.csv")
+```
+
+And pull out Mawhera and Ashley predictions since 2020. I know these Agent numbers so this is easy.
+
+```{r}
+keep.agents<-c("19944", "17471")
+lutz.frame<-dplyr::filter(nz_prediction_frame_23, Agent %in% keep.agents)
+write.csv(lutz.frame, "XGBoost18Opreds.csv")
+```
+
+Pull out just Ashley and Mawhera model comparison with measured
+
+```{r}
+FFsites<-the.sites$Site[c(4,74)]
+iso_plot_obs_fitted(d18O_all_pred_long, FFsites)
+
+```
+
+Now to append the predictions to a single site that isn't already matched to a VCSN point. To do this we use one of Andy's functions.
+
+```{r}
+lat<--42.08302
+lon<-171.798025
+area<-"Greymouth"
+Site<-"Maimai"
+height<-"NA"
+
+site.info.maimai<-data.frame(Site, area, lat, lon, height)
+site.info.plus.vcsn.agent.maimai <- vcsn_append_nearest_vcsn(site.info.maimai, VCSN.directory)
+head(site.info.plus.vcsn.agent.maimai)
+
+```
+
+And cut the national dataframe to just get results from that VCSN point
+
+```{r}
+keep.agent.maimai<-site.info.plus.vcsn.agent.maimai$VCSN.Agent
+magali.frame<-dplyr::filter(nz_prediction_frame_23, Agent %in% keep.agent.maimai)
+write.csv(magali.frame, "XGBoost18Opreds.maimai.csv")
+```
+
+Try again with the post-2000 model
+
+```{r}
+nz_prediction_frame <- predict(model.fit, new_data = vcsn.2020.2023.month) |>
+    bind_cols(vcsn.2020.2023.month) |>
+    select(Agent, lat, lon, Month, Year, MSLP, PET, RH, SoilM, ETmp, Rad, VP, Wind,
+    Rain_bc, Tmax_N, Tmin_N, d18O.pred = .pred)
+```
+
+```{r}
+keep.agent.maimai<-site.info.plus.vcsn.agent.maimai$VCSN.Agent
+magali.frame<-dplyr::filter(nz_prediction_frame, Agent %in% keep.agent.maimai)
+write.csv(magali.frame, "XGBoost18Opreds.maimai.2000.csv")
+```
+
+### Full prediction 2007-2023 over NZ
+
+```{r}
+load(file = "../data/vcsn.2007.2023.RData")
+#load("finalXGBoost.environment.RDATA")
+
+vcsn.2007.2023.orig<-vcsn.2007.2023
+vcsn.2007.2023 <- vcsn.2007.2023.orig |> 
+  rename(lat = Lat, lon = Longt) |>
+  mutate(Month = lubridate::month(Date, label = TRUE), .after = Date) |>
+  mutate(Year= year(lubridate::ymd(Date)), .after = Month)
+names(iso.data.Site)
+#  [1] "d18O"    "Site"    "Date"    "height"  "Month"   "lat"     "lon"     "MSLP"    "PET"     "RH"      "SoilM"  
+# [12] "ETmp"    "Rad"     "VP"      "Wind"    "Rain_bc" "Tmax_N"  "Tmin_N"
+
+table.Agent.elevation <- vcsn.agent.elevations |>
+  st_drop_geometry() |>
+  select(Agent, height = elevation)
+
+vcsn.2007.2023.month <- vcsn.2007.2023 |>
+  select(Agent, Month, Year, lat, lon, 
+    MSLP, PET, RH, SoilM, ETmp, Rad, VP, Wind,
+    Rain_bc, Tmax_N, Tmin_N
+  ) |>
+  summarise(across(MSLP:Tmin_N, ~ mean(.x, na.rm = TRUE)),
+    .by = c(Agent, Month, Year, lat, lon)
+  ) |>
+  left_join(table.Agent.elevation, by = join_by(Agent)) |>
+  relocate(height, .before = Month) |>
+  mutate(Date = NA) |>
+  relocate(Date) |>
+  mutate(Site = NA) |>
+  relocate(Site) 
+
+num.VCSN.Agent <- length(unique(vcsn.2007.2023.month$Agent))
+
+rm(vcsn.2007.2023)
+ 
+```
+
+```{r}
+nz_prediction_frame <- predict(model.fit, new_data = vcsn.2007.2023.month) |>
+    bind_cols(vcsn.2007.2023.month) |>
+    select(Agent, lat, lon, Date, Month, Year, MSLP, PET, RH, SoilM, ETmp, Rad, VP, Wind,
+    Rain_bc, Tmax_N, Tmin_N, d18O.pred = .pred)
+
+nz_prediction_frame$day<-15
+add.dates<-nz_prediction_frame %>% 
+  select(day, Month, Year) %>% 
+  mutate(Date = make_date(Year, Month, day))
+nz_prediction_frame$Date<-add.dates$Date
+
+```
+
+```{r}
+write.csv(nz_prediction_frame, "XGBoost.d18O.2007.2023.csv")
+```
+
+```{r}
+nz_prediction_frame_23$day<-15
+add.dates<-nz_prediction_frame_23 %>% 
+  select(day, Month, Year) %>% 
+  mutate(Date = make_date(Year, Month, day))
+nz_prediction_frame_23$Date<-add.dates$Date
+
+write.csv(nz_prediction_frame_23, "XGBoost.d18O.2020.2023.csv")
+
+save.image(file = "Final environment june2024.RData")
+```
